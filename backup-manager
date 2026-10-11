@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Linux Backup and Recovery Manager
-# A small student project for creating and restoring compressed backups.
 
 set -u
 
