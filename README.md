@@ -63,7 +63,6 @@ you can remove that archive and its matching checksum afterward if desired.
 
 ## Limitations
 
-- This is a small educational project, not a replacement for professional backup software.
 - Checksums are stored locally beside the project, so they do not protect against an attacker who can change both the archive and checksum.
 - It does not encrypt backups, schedule automatic backups, or store copies off-site.
 - Restoring can merge files into an existing directory; review the destination carefully.
@@ -71,5 +70,4 @@ you can remove that archive and its matching checksum afterward if desired.
 
 ## Project log
 
-See `DEVELOPMENT_LOG.md` for the four-day development plan. Update it with the actual work
-and dates as development happens.
+See `DEVELOPMENT_LOG.md` for the development plan.
