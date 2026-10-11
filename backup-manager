@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Linux Backup and Recovery Manager
+# A small student project for creating and restoring compressed backups.
+
+set -u
+
+APP_NAME="Linux Backup and Recovery Manager"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BACKUP_DIR="$SCRIPT_DIR/backups"
+LOG_DIR="$SCRIPT_DIR/logs"
+CHECKSUM_DIR="$SCRIPT_DIR/checksums"
+LOG_FILE="$LOG_DIR/backup.log"
+
+# Make the storage folders if they are missing.
+mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$CHECKSUM_DIR" || {
+    echo "ERROR: Could not create the project folders."
+    exit 1
+}
+
+log_event() {
+    local message="$1"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$message" >> "$LOG_FILE"
+}
+
+usage() {
+    cat <<'HELP'
+Linux Backup and Recovery Manager
+---------------------------------
+Usage:
+  ./backup-manager backup PATH
+  ./backup-manager list
+  ./backup-manager verify ARCHIVE_NAME
+  ./backup-manager restore ARCHIVE_NAME DESTINATION
+  ./backup-manager history
+  ./backup-manager help
+
+Examples:
+  ./backup-manager backup ~/Documents
+  ./backup-manager list
+  ./backup-manager verify documents_20261011_120000.tar.gz
+  ./backup-manager restore documents_20261011_120000.tar.gz ~/RestoredFiles
+
+Backups are stored in the project's backups/ folder.
+HELP
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "ERROR: Required command '$1' was not found."
+        log_event "ERROR missing required command: $1"
+        exit 1
+    }
+}
+
+backup_files() {
+    local source_path="$1"
+    local source_abs source_parent source_name stamp archive checksum_file temp_archive
+
+    if [[ ! -d "$source_path" ]]; then
+        echo "ERROR: That directory does not exist: $source_path"
+        log_event "ERROR backup source not found: $source_path"
+        return 1
+    fi
+
+    source_abs="$(cd -- "$source_path" 2>/dev/null && pwd -P)" || {
+        echo "ERROR: Could not open that directory."
+        return 1
+    }
+
+    # Avoid accidentally backing up the program's own backup storage.
+    case "$source_abs/" in
+        "$BACKUP_DIR/"*|"$SCRIPT_DIR/backups/"*)
+            echo "ERROR: Please choose a source outside the backups folder."
+            log_event "ERROR refused backup source inside backup storage"
+            return 1
+            ;;
+    esac
+
+    source_parent="$(dirname -- "$source_abs")"
+    source_name="$(basename -- "$source_abs")"
+    stamp="$(date '+%Y%m%d_%H%M%S')"
+    archive="${source_name}_${stamp}.tar.gz"
+
+    # If two backups happen in the same second, add a small suffix.
+    if [[ -e "$BACKUP_DIR/$archive" ]]; then
+        archive="${source_name}_${stamp}_$RANDOM.tar.gz"
+    fi
+
+    temp_archive="$BACKUP_DIR/.$archive.tmp"
+    checksum_file="$CHECKSUM_DIR/$archive.sha256"
+
+    echo "Making a backup of: $source_abs"
+    if tar -czf "$temp_archive" -C "$source_parent" -- "$source_name"; then
+        mv -- "$temp_archive" "$BACKUP_DIR/$archive" || {
+            rm -f -- "$temp_archive"
+            echo "ERROR: Could not save the archive."
+            log_event "ERROR could not move temporary archive"
+            return 1
+        }
+        sha256sum "$BACKUP_DIR/$archive" | awk '{print $1}' > "$checksum_file" || {
+            rm -f -- "$BACKUP_DIR/$archive"
+            echo "ERROR: Backup made, but checksum could not be saved."
+            log_event "ERROR checksum creation failed for $archive"
+            return 1
+        }
+        echo "Backup complete!"
+        echo "Archive: $archive"
+        echo "Location: $BACKUP_DIR/$archive"
+        echo "Size: $(du -h "$BACKUP_DIR/$archive" | awk '{print $1}')"
+        log_event "BACKUP OK source=$source_abs archive=$archive"
+        return 0
+    else
+        rm -f -- "$temp_archive"
+        echo "ERROR: tar could not create the backup."
+        log_event "ERROR backup failed source=$source_abs"
+        return 1
+    fi
+}
+
+list_backups() {
+    shopt -s nullglob
+    local files=("$BACKUP_DIR"/*.tar.gz)
+    shopt -u nullglob
+
+    if (( ${#files[@]} == 0 )); then
+        echo "No backups found yet."
+        return 0
+    fi
+
+    echo "Saved backups"
+    echo "-------------"
+    printf '%-42s %-10s %s\n' "ARCHIVE" "SIZE" "LAST MODIFIED"
+    for file in "${files[@]}"; do
+        printf '%-42s %-10s %s\n' \
+            "$(basename -- "$file")" \
+            "$(du -h "$file" | awk '{print $1}')" \
+            "$(date -r "$file" '+%Y-%m-%d %H:%M')"
+    done
+}
+
+get_archive_path() {
+    local name="$1"
+    # Only accept a filename, not a path supplied by the caller.
+    if [[ "$name" == */* || "$name" == "." || "$name" == ".." ]]; then
+        return 1
+    fi
+    [[ -f "$BACKUP_DIR/$name" ]] || return 1
+    printf '%s\n' "$BACKUP_DIR/$name"
+}
+
+verify_backup() {
+    local name="$1" archive expected actual checksum_file
+    archive="$(get_archive_path "$name")" || {
+        echo "ERROR: Backup not found. Use the filename shown by 'list'."
+        log_event "ERROR verify archive not found: $name"
+        return 1
+    }
+    checksum_file="$CHECKSUM_DIR/$name.sha256"
+
+    if [[ ! -f "$checksum_file" ]]; then
+        echo "ERROR: No saved checksum exists for this archive."
+        log_event "ERROR checksum missing for $name"
+        return 1
+    fi
+
+    expected="$(cat -- "$checksum_file")"
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+
+    if [[ "$expected" == "$actual" ]]; then
+        echo "OK: Checksum matches for $name"
+        log_event "VERIFY OK archive=$name"
+        # Also check that gzip can read the compressed stream.
+        if gzip -t "$archive"; then
+            echo "OK: Compressed archive can be read."
+            return 0
+        else
+            echo "WARNING: gzip reported a problem with the archive."
+            log_event "ERROR gzip test failed for $name"
+            return 1
+        fi
+    else
+        echo "FAILED: Checksum does not match. The archive may have changed."
+        log_event "VERIFY FAILED archive=$name"
+        return 1
+    fi
+}
+
+restore_backup() {
+    local name="$1" destination="$2" archive member
+    archive="$(get_archive_path "$name")" || {
+        echo "ERROR: Backup not found. Use the filename shown by 'list'."
+        log_event "ERROR restore archive not found: $name"
+        return 1
+    }
+
+    if [[ -e "$destination" && ! -d "$destination" ]]; then
+        echo "ERROR: Destination exists but is not a directory."
+        return 1
+    fi
+
+    if ! verify_backup "$name"; then
+        echo "Restore cancelled because verification failed."
+        return 1
+    fi
+
+    # Check each archive entry before extracting to reduce path traversal risk.
+    while IFS= read -r member; do
+        case "$member" in
+            /*|../*|*/../*|*/..)
+                echo "ERROR: Archive contains a suspicious path: $member"
+                log_event "ERROR unsafe archive path in $name"
+                return 1
+                ;;
+        esac
+    done < <(tar -tzf "$archive")
+
+    if [[ -d "$destination" ]] && [[ -n "$(find "$destination" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        echo "WARNING: Destination is not empty: $destination"
+        read -r -p "Continue and allow files to merge? (yes/no): " answer
+        if [[ "$answer" != "yes" ]]; then
+            echo "Restore cancelled."
+            log_event "RESTORE CANCELLED archive=$name"
+            return 1
+        fi
+    fi
+
+    mkdir -p -- "$destination" || {
+        echo "ERROR: Could not create destination directory."
+        return 1
+    }
+
+    if tar -xzf "$archive" -C "$destination"; then
+        echo "Restore finished."
+        echo "Files were extracted into: $destination"
+        log_event "RESTORE OK archive=$name destination=$destination"
+        return 0
+    else
+        echo "ERROR: Restore failed."
+        log_event "ERROR restore failed archive=$name destination=$destination"
+        return 1
+    fi
+}
+
+show_history() {
+    if [[ -s "$LOG_FILE" ]]; then
+        cat -- "$LOG_FILE"
+    else
+        echo "There is no history yet."
+    fi
+}
+
+# Basic dependency checks. No root access should be needed.
+case "${1:-help}" in
+    backup)
+        [[ $# -eq 2 ]] || { usage; exit 2; }
+        need_command tar
+        need_command gzip
+        need_command sha256sum
+        backup_files "$2"
+        exit $?
+        ;;
+    list)
+        [[ $# -eq 1 ]] || { usage; exit 2; }
+        list_backups
+        ;;
+    verify)
+        [[ $# -eq 2 ]] || { usage; exit 2; }
+        need_command sha256sum
+        need_command gzip
+        verify_backup "$2"
+        exit $?
+        ;;
+    restore)
+        [[ $# -eq 3 ]] || { usage; exit 2; }
+        need_command tar
+        need_command gzip
+        need_command sha256sum
+        restore_backup "$2" "$3"
+        exit $?
+        ;;
+    history)
+        [[ $# -eq 1 ]] || { usage; exit 2; }
+        show_history
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Try './backup-manager help'"
+        log_event "ERROR unknown command: $1"
+        exit 2
+        ;;
+esac
